@@ -60,7 +60,7 @@ class ImageMaskerApp:
         self.block_size_slider.grid(row=2, column=1, padx=10)
         self.block_size_value = ttk.Label(self.controls_frame, text="11")
         self.block_size_value.grid(row=2, column=2)
-        # C constant slider
+        #C constant slider
         ttk.Label(self.controls_frame, text="C Constant:").grid(row=3, column=0, sticky='e')
         self.c_constant_var = tk.DoubleVar(value=2)
         self.c_constant_slider = ttk.Scale(
@@ -96,7 +96,7 @@ class ImageMaskerApp:
         self.block_size_value.config(text=str(block_size))
         self.c_constant_value.config(text=str(c_constant))
         self.kernel_size_value.config(text=str(kernel_size))
-        #create initial mask using adaptive thresholding
+        #creates initial mask using adaptive thresholding
         mask = cv2.adaptiveThreshold(
             self.blurred_image,
             255,
@@ -105,15 +105,15 @@ class ImageMaskerApp:
             block_size,
             c_constant
         )
-        #if fill option is selected, apply morphological operations
+        #if fill option is selected, applies morphological operations
         if self.fill_var.get():
-            #create kernel for morphological operations
+            #creates kernel for morphological operations
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
             
-            #apply dilation to fill gaps
+            #applies dilation to fill gaps
             mask = cv2.dilate(mask, kernel, iterations=1)
             
-            # apply morphological closing to smooth the mask
+            #applies morphological closing to smooth the mask
             mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
         self.current_mask = mask
         self.mask_image = cv2.cvtColor(self.current_mask, cv2.COLOR_GRAY2RGB)
