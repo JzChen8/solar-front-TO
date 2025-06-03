@@ -8,17 +8,17 @@ from scipy.sparse import lil_matrix
 from scipy.sparse.linalg import spsolve
 
 def mask_to_conductivity(mask, r=3, sigma0=1.0, void_eps=1e-6):
-    # SIMP penalization: sigma(x) = x^r * sigma0
+    #SIMP penalization: sigma(x) = x^r * sigma0, prevents the problem from becoming discrete, allows for gradient biasing
     density = mask.astype(float)
     sigma = (density ** r) * sigma0
-    sigma[density == 0] = void_eps  # Voids get near-zero conductivity
+    sigma[density == 0] = void_eps  #voids get near-zero conductivity (not abs zero or else it could cause more trouble at the border eg. dividing by zero)
     return sigma
 
 def solve_poisson(mask, sigma, electrode_mask, electrode_potential=1.0):
     ny, nx = mask.shape
     material = mask == 1
     electrodes = electrode_mask == 1
-    # Map (i, j) for material pixels to equation indices
+    #maps (i, j) for material pixels to equation indices
     ij_to_eq = -np.ones((ny, nx), dtype=int)
     eq_to_ij = []
     eq = 0
@@ -28,33 +28,33 @@ def solve_poisson(mask, sigma, electrode_mask, electrode_potential=1.0):
                 ij_to_eq[i, j] = eq
                 eq_to_ij.append((i, j))
                 eq += 1
-    N = eq  # Number of unknowns (material pixels only)
+    N = eq  #number of unknowns (material pixels only)
     A = lil_matrix((N, N))
     b = np.zeros(N)
     for eq, (i, j) in enumerate(eq_to_ij):
         if electrodes[i, j]:
-            # Dirichlet: fixed potential at electrode
+            #Dirichlet: fixed potential at electrode
             A[eq, eq] = 1
             b[eq] = electrode_potential
         else:
-            # Interior (material, not electrode)
+            #this is the interior (material, not electrode)
             s_center = 0.0
-            # Left neighbor
+            #left neighbor
             if j > 0 and material[i, j - 1]:
                 sxm = sigma[i, j - 1]
                 s_center += sxm
                 A[eq, ij_to_eq[i, j - 1]] = sxm
-            # Right neighbor
+            #right neighbor
             if j < nx - 1 and material[i, j + 1]:
                 sxp = sigma[i, j + 1]
                 s_center += sxp
                 A[eq, ij_to_eq[i, j + 1]] = sxp
-            # Up neighbor
+            #up neighbor
             if i > 0 and material[i - 1, j]:
                 sym = sigma[i - 1, j]
                 s_center += sym
                 A[eq, ij_to_eq[i - 1, j]] = sym
-            # Down neighbor
+            #down neighbor
             if i < ny - 1 and material[i + 1, j]:
                 syp = sigma[i + 1, j]
                 s_center += syp
@@ -73,7 +73,7 @@ def visualize_potential(V, mask):
     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='Potential (V)')
     ax.set_title('Potential Field')
     ax.axis('off')
-    # Description below the colorbar
+    #description below the colorbar
     description = (
         "Plasma colormap: yellow/white = high potential (left, 1V),\n"
         "purple = low potential (right, 0V).\n"
@@ -115,7 +115,7 @@ def interactive_solve():
         if len(electrode_points) != 2:
             messagebox.showwarning("Electrode Selection", "You must select two points inside the mask.")
             return
-        # Build electrode mask and potentials
+        #builds electrode mask and potentials
         electrode_mask = np.zeros_like(mask)
         electrode_potential = np.full_like(mask, np.nan, dtype=float)
         (y1, x1), (y2, x2) = electrode_points
@@ -123,7 +123,7 @@ def interactive_solve():
         electrode_mask[y2, x2] = 1
         electrode_potential[y1, x1] = 1.0  # Anode
         electrode_potential[y2, x2] = 0.0  # Cathode
-        # Modify solver to accept per-pixel electrode_potential
+        #modifies solver to accept per-pixel electrode_potential
         V = solve_poisson_custom_electrodes(mask, sigma, electrode_mask, electrode_potential)
         messagebox.showinfo("Poisson Solver", f"Solved for potential.\nShape: {V.shape}")
         visualize_potential(V, mask)
