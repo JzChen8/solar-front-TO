@@ -4,8 +4,6 @@ from tkinter import ttk
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-#these are the main libraries: numpy for math, tkinter for gui, matplotlib for plots
-#think of tkinter as the control panel, matplotlib as the window to see the electrode growth
 
 #constants for the physics and grid
 q = 1.602e-19 #electron charge
@@ -14,7 +12,7 @@ T = 300 #room temp (kelvin)
 beta = q / (kB * T) #thermal voltage factor
 sigma_TCO = 1e5 #conductivity of tco (transparent conductor)
 sigma_metal = 1e7 #conductivity of metal
-t_hickness_TCO = 200e-9 #tco thickness
+thickness_TCO = 200e-9 #tco thickness
 thickness_metal = 10e-6 #metal thickness
 Nx, Ny = 40, 40 #grid size (elements in x/y)
 Lx, Ly = 0.1, 0.1 #physical size in meters
@@ -345,75 +343,63 @@ def update_design(x, dPdx, vol_frac_target, move=0.05):
 
 class TO_GUI:
     def __init__(self, root):
-        #main gui class: sets up everything you see and click
         self.root = root
-        self.flicker_state = False  #for flicker effect during optimization
+        self.flicker_state = False  #flicker toggle for animation
         self.root.title("Solar Cell Front Electrode Topology Optimization - Dendrite Growth")
-        #no fixed minsize: everything stretches with window
-        self.root.columnconfigure(0, weight=1, minsize=150) #left for controls
-        self.root.columnconfigure(1, weight=3) #right for plot
+        #self.root.minsize(400, 780) #not needed since everything's dynamic now
+        self.root.columnconfigure(0, weight=1, minsize=150) #left: controls
+        self.root.columnconfigure(1, weight=3) #right: plot
         for i in range(12):
             self.root.rowconfigure(i, weight=1) #make all rows stretch
 
         self.Nx = Nx
         self.Ny = Ny
-        #these are tkinter variables so sliders and entries update automatically
-        self.vol_frac_target = tk.DoubleVar(value=0.03)  #volume fraction slider
-        self.penal = tk.DoubleVar(value=4.0)  #simp penalization slider
-        self.r_min = tk.DoubleVar(value=0.0075)  #filter radius slider
+        self.vol_frac_target = tk.DoubleVar(value=0.03)  #volume fraction slider var
+        self.penal = tk.DoubleVar(value=4.0)  #penalization slider var
+        self.r_min = tk.DoubleVar(value=0.0075)  #filter radius slider var
 
-        #design variable: 1d array for electrode density, starts empty
+        #initialize design as all empty
         self.x = np.zeros(self.Nx * self.Ny)
-        self.mask = None #mask will be loaded from png
+        self.mask = None
 
-        #matplotlib figure for showing the electrode pattern
+        #make the plot and embed in gui
         self.fig, self.ax = plt.subplots(figsize=(5,5))
         self.canvas = FigureCanvasTkAgg(self.fig, master=root)
-        self.canvas.get_tk_widget().grid(row=0, column=1, rowspan=12, padx=10, pady=10, sticky='nsew') #plot fills right side
+        self.canvas.get_tk_widget().grid(row=0, column=1, rowspan=12, padx=10, pady=10, sticky='nsew')
 
-        #all the widgets below are controls for the optimization
-        #load mask button lets you pick a png file
+        #add all the control widgets
         self.load_button = ttk.Button(root, text="Load Mask PNG", command=self.load_mask)
         self.load_button.grid(row=0, column=0, pady=0, sticky='nsew')
 
-        #volume fraction slider
         ttk.Label(root, text="Volume Fraction Target").grid(row=1, column=0, sticky='nsew')
-        self.vol_slider = ttk.Scale(root, from_=0.01, to=0.1, variable=self.vol_frac_target, orient='horizontal')
+        self.vol_slider = ttk.Scale(root, from_=0.01, to=0.1, variable=self.vol_frac_target, orient='horizontal')  #slider for volume fraction
         self.vol_slider.grid(row=2, column=0, pady=0, sticky='nsew')
 
-        #simp penalization slider
         ttk.Label(root, text="SIMP Penalization (p)").grid(row=3, column=0, sticky='nsew')
-        self.penal_slider = ttk.Scale(root, from_=2.0, to=6.0, variable=self.penal, orient='horizontal')
+        self.penal_slider = ttk.Scale(root, from_=2.0, to=6.0, variable=self.penal, orient='horizontal')  #slider for penalization
         self.penal_slider.grid(row=4, column=0, pady=0, sticky='nsew')
 
-        #filter radius slider
         ttk.Label(root, text="Filter Radius (fraction of Nx)").grid(row=5, column=0, sticky='nsew')
-        self.rmin_slider = ttk.Scale(root, from_=0.0025, to=0.05, variable=self.r_min, orient='horizontal')
+        self.rmin_slider = ttk.Scale(root, from_=0.0025, to=0.05, variable=self.r_min, orient='horizontal')  #slider for filter radius
         self.rmin_slider.grid(row=6, column=0, pady=0, sticky='nsew')
 
-        #max iterations entry
         ttk.Label(root, text="Max Iterations").grid(row=7, column=0, sticky='nsew')
         self.max_iter_entry = ttk.Entry(root)
-        self.max_iter_entry.insert(0, "100")
+        self.max_iter_entry.insert(0, "100")  #default value
         self.max_iter_entry.grid(row=8, column=0, pady=0, sticky='nsew')
 
-        #run button starts the optimization
         self.run_button = ttk.Button(root, text="Run Optimization", command=self.run_optimization)
         self.run_button.grid(row=9, column=0, pady=0, sticky='nsew')
 
-        #reset button resets design to initial state
         self.reset_button = ttk.Button(root, text="Reset", command=self.reset)
         self.reset_button.grid(row=10, column=0, pady=0, sticky='nsew')
 
-        #status label shows progress and errors
         self.status_label = ttk.Label(root, text="")
         self.status_label.grid(row=11, column=0, columnspan=2, pady=0, sticky='nsew')
 
-        self.update_plot() #draw the initial (empty) plot
+        self.update_plot() #draw the initial plot
 
     def load_mask(self):
-        #lets user pick a png file as a mask
-        #analogy: like putting painter's tape on a canvas to block certain areas
         from tkinter import filedialog
         from PIL import Image
         
@@ -424,61 +410,58 @@ class TO_GUI:
         
         if file_path:
             try:
-                #load and resize image to match grid size
+                # Load and resize image
                 img = Image.open(file_path).convert('L')
                 img = img.resize((self.Nx, self.Ny))
                 self.mask = np.array(img) / 255.0
                 
-                #initialize design variable with mask (all zeros except mask)
+                # Initialize design variable with mask
                 self.x = np.zeros_like(self.mask.flatten())
-                #add seed points where mask is white (could be more clever)
+                # Add seed points where mask is white
                 seed_points = np.where(self.mask.flatten() > 0.5)[0]
                 if len(seed_points) > 0:
                     self.x[seed_points] = 1.0
                 
-                #show the mask on the plot
+                # Update plot
                 self.update_plot()
                 self.status_label.config(text=f"Loaded mask from {file_path}")
             except Exception as e:
                 self.status_label.config(text=f"Error loading mask: {str(e)}")
 
     def update_plot(self):
-        #draws the current design and mask on the matplotlib plot
-        #analogy: like painting the current state of the canvas after each brush stroke
         if not hasattr(self, 'ax') or self.ax is None:
-            return #plot components not initialized (shouldn't happen)
+            return # Plot components are not initialized (likely for GUI debugging)
         self.ax.clear()
         x_reshaped = self.x.reshape((self.Ny, self.Nx))
         self.ax.imshow(x_reshaped, cmap='inferno', origin='lower', vmin=0, vmax=1)
         if self.mask is not None:
-            #overlay mask in semi-transparent white
+            # Overlay mask in semi-transparent white
             self.ax.imshow(self.mask, cmap='gray', alpha=0.3, origin='lower')
         self.ax.set_title("Electrode Density")
         self.canvas.draw()
 
     def reset(self):
-        #resets the design: if mask is loaded, seeds from mask; otherwise, single center seed
-        #analogy: like wiping the canvas and starting with a single paint dot or a stencil
         if self.mask is not None:
-            #reset to seed points in mask
+            # Reset to seed points in mask
             self.x = np.zeros_like(self.mask.flatten())
             seed_points = np.where(self.mask.flatten() > 0.5)[0]
             if len(seed_points) > 0:
                 self.x[seed_points] = 1.0
         else:
-            #reset to single center point
+            # Reset to single center point
             self.x = np.zeros(self.Nx * self.Ny)
             center_idx = (self.Ny // 2) * self.Nx + (self.Nx // 2)
             self.x[center_idx] = 1.0
         self.update_plot()
 
     def run_optimization(self):
-        #main optimization loop: runs when you click 'run optimization'
-        #analogy: like growing a crystal, step by step, while showing progress
+        # If no mask is loaded, self.x should be initialized by self.reset() 
+        # (e.g., to a single point or other default)
+        # The optimization will then run based on that initial self.x
         try:
             max_iter = int(self.max_iter_entry.get())
         except ValueError:
-            max_iter = 100 #if entry is invalid, use default
+            max_iter = 100 # Default if entry is invalid
             self.max_iter_entry.delete(0, tk.END)
             self.max_iter_entry.insert(0, str(max_iter))
             print("Warning: Invalid max_iter input, using default 100")
@@ -488,39 +471,41 @@ class TO_GUI:
         rmin_val = self.r_min.get()
         print(f"Using GUI params: max_iter={max_iter}, penal={penal_val:.2f}, vol_target={vol_target:.3f}, rmin={rmin_val:.4f}")
 
-        x = self.x.copy() #start with the current design (from reset or mask)
+        x = self.x.copy() # Start with the current design (could be from reset or mask)
+        
+        # Start with a smaller move limit and gradually increase it
+        # move_limit = 0.01 # Redundant: move_limit is now set consistently in the loop
         
         self.status_label.config(text="Starting optimization...")
-        self.root.update_idletasks() #show status right away
+        self.root.update_idletasks() # Ensure status label updates
 
         for it in range(max_iter):
-            move_limit = 0.015 #step size for design update
-            
-            U = newton_solver(x, penal_val) #solve for voltages
-            dPdx = sensitivity_analysis(U, x, penal_val) #get sensitivities
-            x_filtered = density_filter(x, rmin_val) #smooth the design
-            x_updated = update_design(x_filtered, dPdx, vol_target, move=move_limit) #update electrode pattern
-            
-            #apply mask if present (blocks growth in masked regions)
+            #gradually increase move limit (not used in this debug version)
+            move_limit = 0.015 #constant small move limit
+            print(f'#debug: running iteration {it+1}/{max_iter}')
+            U = newton_solver(x, penal_val)
+            dPdx = sensitivity_analysis(U, x, penal_val)
+            x_filtered = density_filter(x, rmin_val) #filter before update_design
+            x_updated = update_design(x_filtered, dPdx, vol_target, move=move_limit)
+            #apply mask constraint if mask is present
             if self.mask is not None:
                 x = x_updated * self.mask.flatten()
             else:
                 x = x_updated
 
-            #update plot every 5 steps (and last step)
-            if it % 5 == 0 or it == max_iter - 1:
-                self.x = x #update gui's design variable
-                #flicker effect: toggles a 5x5 square in the corner so you can see it updating
-                sz = 5
-                if self.flicker_state:
-                    self.x[:sz*sz] = 1.0
-                else:
-                    self.x[:sz*sz] = 0.0
-                self.flicker_state = not self.flicker_state
-                self.status_label.config(text=f"Iteration {it+1}/{max_iter}")
+            self.x = x #update gui's design variable
+            #flicker effect: toggle a 5x5 square in the top-left
+            sz = 5
+            if self.flicker_state:
+                self.x[:sz*sz] = 1.0
+            else:
+                self.x[:sz*sz] = 0.0
+            self.flicker_state = not self.flicker_state
+            self.status_label.config(text=f'iteration {it+1}/{max_iter}')
+            if it % 2 == 0 or it == max_iter - 1:
                 self.update_plot()
-                self.root.update() #process gui events
-                self.root.update_idletasks() #extra update for smoothness
+            self.root.update() #process gui events
+            self.root.update_idletasks() #extra gui update
 
         self.status_label.config(text="Optimization Complete")
 
