@@ -4,43 +4,523 @@ from tkinter import ttk
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-
-#constants for the physics and grid
-q = 1.602e-19 #electron charge
-kB = 1.38e-23 #boltzmann constant
-T = 300 #room temp (kelvin)
-beta = q / (kB * T) #thermal voltage factor
-sigma_TCO = 1e5 #conductivity of tco (transparent conductor)
-sigma_metal = 1e7 #conductivity of metal
-thickness_TCO = 200e-9 #tco thickness
-thickness_metal = 10e-6 #metal thickness
-Nx, Ny = 40, 40 #grid size (elements in x/y)
-Lx, Ly = 0.1, 0.1 #physical size in meters
-dx, dy = Lx / Nx, Ly / Ny #element size
-V_bus = 0.6 #busbar voltage (voltage applied to left)
-penal = 3.0 #simp penalization (encourages 0/1 material)
-r_min = 0.01 #filter radius (for smoothing design)
-vol_frac_target = 0.05 #target fraction of metal
-j0 = 0.0001 #reverse current density
-jL = 40 #photocurrent density
-max_newton_iter = 20 #max iterations for newton solver
-newton_tol = 1e-6 #tolerance for newton solver
-max_TO_iter = 50 #max topology optimization iterations
-
-
-# New functions based on solar cell paper equations (Eq. 15, 17, 18, 19, 20, 30, 31, 33)
+q = 1.602e-19
+kB = 1.38e-23
+T = 300
+beta = q / (kB * T)
+sigma_TCO = 1e5
+sigma_metal = 1e7
+thickness_TCO = 200e-9
+thickness_metal = 10e-6
+Nx, Ny = 40, 40
+Lx, Ly = 0.1, 0.1
+dx, dy = Lx / Nx, Ly / Ny
+V_bus = 0.6
+penal = 3.0
+r_min = 0.01
+vol_frac_target = 0.05
+j0 = 0.0001
+jL = 40
+max_newton_iter = 20
+newton_tol = 1e-6
+max_TO_iter = 50
 
 def calculate_local_voltage(shape_function_vector: np.ndarray, nodal_voltage_vector: np.ndarray) -> float:
-    #eq 15: local voltage is just a weighted sum of the voltages at the corners
-    #analogy: like blending four corner heights to get the height at a point on a trampoline
     if shape_function_vector.shape != nodal_voltage_vector.shape:
         raise ValueError("Shape function vector and nodal voltage vector must have the same dimensions.")
     return np.dot(shape_function_vector, nodal_voltage_vector)
 
 def calculate_corrected_photocurrent_density(jL: float, xe: float, r_val: float) -> float:
+    return jL * ((1 - xe)**r_val)
+
+def calculate_element_current_density(j_star_L: float, j0_val: float, beta_val: float, local_voltage: float) -> float:
+    return j_star_L + j0_val * (np.exp(beta_val * local_voltage) - 1)
+
+def calculate_power_output(Vbus: float, Ae: float, J_elements: np.ndarray) -> float:
+    return Vbus * Ae * np.sum(J_elements)
+
+def objective_function(Pout: float) -> float:
+    return -Pout
+
+def calculate_weight_factor_Hei(rmin: float, distance_e_i: float) -> float:
+    return max(0, rmin - distance_e_i)
+
+def element_conductivity_matrix(dx, dy):
+    k = 1 / (dx * dy)
+    G0 = k * np.array([[2, -1, -1, 0],
+                       [-1, 2, 0, -1],
+                       [-1, 0, 2, -1],
+                       [0, -1, -1, 2]])
+    return G0
+
+G0 = element_conductivity_matrix(dx, dy)
+
+def simp_interpolation(xe, penal, sigma_min, sigma_max):
+    return sigma_min + (sigma_max - sigma_min) * (xe ** penal)
+
+def assemble_global_conductivity(x, penal):
+    n_nodes_x = Nx + 1
+    n_nodes_y = Ny + 1
+    n_nodes = n_nodes_x * n_nodes_y
+    G = np.zeros((n_nodes, n_nodes))
+    for ey in range(Ny):
+        for ex in range(Nx):
+            e = ey * Nx + ex
+            sigma_e = simp_interpolation(x[e], penal, sigma_TCO, sigma_metal)
+            ke = sigma_e * (thickness_TCO + thickness_metal) * G0
+            n1 = ey * n_nodes_x + ex
+            n2 = n1 + 1
+            n3 = n1 + n_nodes_x
+            n4 = n3 + 1
+            nodes = [n1, n2, n4, n3]
+            for i_local, i_global in enumerate(nodes):
+                for j_local, j_global in enumerate(nodes):
+                    G[i_global, j_global] += ke[i_local, j_local]
+    return G
+
+def apply_boundary_conditions(G, b, V_bus):
+    n_nodes_x = Nx + 1
+    n_nodes_y = Ny + 1
+    if hasattr(app, 'mask_border_pixels') and app.mask_border_pixels:
+        for y, x in app.mask_border_pixels:
+            node = y * n_nodes_x + x
+            G[node, :] = 0
+            G[:, node] = 0
+            G[node, node] = 1
+            b[node] = V_bus
+    else:
+        for j in range(n_nodes_y):
+            node = j * n_nodes_x
+            G[node, :] = 0
+            G[:, node] = 0
+            G[node, node] = 1
+            b[node] = V_bus
+            node = j * n_nodes_x + Nx
+            G[node, :] = 0
+            G[:, node] = 0
+            G[node, node] = 1
+            b[node] = 0.0
+    return G, b
+
+def j_from_V(Ve, xe, penal, r=3):
+    jL_star = jL * (1 - xe ** r)
+    j0_const = j0
+    j = jL_star - j0_const * (np.exp(beta * Ve) - 1)
+    return j
+
+def build_nodal_to_element_mapping():
+    n_nodes_x = Nx + 1
+    nodemap = np.zeros((Ny, Nx, 4), dtype=int)
+    for ey in range(Ny):
+        for ex in range(Nx):
+            n1 = ey * n_nodes_x + ex
+            n2 = n1 + 1
+            n3 = n1 + n_nodes_x
+            n4 = n3 + 1
+            nodemap[ey, ex, :] = [n1, n2, n4, n3]
+    return nodemap
+
+nodemap = build_nodal_to_element_mapping()
+
+def compute_current_density(U, xe, penal):
+    j_e = np.zeros(Nx * Ny)
+    for ey in range(Ny):
+        for ex in range(Nx):
+            e = ey * Nx + ex
+            nodes = nodemap[ey, ex, :]
+            Ve = np.mean(U[nodes])
+            j_e[e] = j_from_V(Ve, xe[e], penal)
+    return j_e
+
+def power_output(U, xe, penal):
+    j_e = compute_current_density(U, xe, penal)
+    A_e = dx * dy
+    n_nodes = (Nx + 1) * (Ny + 1)
+    U_e = np.zeros(Nx * Ny)
+    for ey in range(Ny):
+        for ex in range(Nx):
+            e = ey * Nx + ex
+            nodes = nodemap[ey, ex, :]
+            U_e[e] = np.mean(U[nodes])
+    Pout = np.sum(j_e * U_e) * A_e
+    return Pout
+
+def residual(U, xe, penal):
+    G = assemble_global_conductivity(xe, penal)
+    b = np.zeros_like(U)
+    G, b = apply_boundary_conditions(G, b, V_bus)
+    I = np.zeros_like(U)
+    for ey in range(Ny):
+        for ex in range(Nx):
+            e = ey * Nx + ex
+            nodes = nodemap[ey, ex, :]
+            Ve = np.mean(U[nodes])
+            je = j_from_V(Ve, xe[e], penal)
+            for n in nodes:
+                I[n] += je / 4
+    R = G @ U - I
+    return R, G, I
+
+def newton_solver(xe, penal):
+    n_nodes = (Nx + 1) * (Ny + 1)
+    U = np.zeros(n_nodes)
+    n_nodes_x = Nx + 1
+    if hasattr(app, 'mask_border_pixels') and app.mask_border_pixels:
+        for y, x in app.mask_border_pixels:
+            node = y * n_nodes_x + x
+            U[node] = V_bus
+    else:
+        for j in range(Ny + 1):
+            anode_node = j * n_nodes_x
+            cathode_node = j * n_nodes_x + Nx
+            U[anode_node] = V_bus
+            U[cathode_node] = 0.0
+    for iter in range(max_newton_iter):
+        R, G, I = residual(U, xe, penal)
+        normR = np.linalg.norm(R)
+        if normR < newton_tol:
+            break
+        try:
+            delta_U = np.linalg.solve(G, -R)
+        except np.linalg.LinAlgError:
+            print("Singular matrix in Newton solver")
+            break
+        U += delta_U
+        if hasattr(app, 'mask_border_pixels') and app.mask_border_pixels:
+            for y, x in app.mask_border_pixels:
+                node = y * n_nodes_x + x
+                U[node] = V_bus
+        else:
+            for j in range(Ny + 1):
+                anode_node = j * n_nodes_x
+                cathode_node = j * n_nodes_x + Nx
+                U[anode_node] = V_bus
+                U[cathode_node] = 0.0
+    return U
+
+def density_filter(x, r_min):
+    x_filtered = np.zeros_like(x)
+    n = Nx * Ny
+    for i in range(n):
+        ix, iy = i % Nx, i // Nx
+        sum_w = 0
+        val = 0
+        for j in range(n):
+            jx, jy = j % Nx, j // Nx
+            dist = np.sqrt((ix - jx) ** 2 + (iy - jy) ** 2)
+            if dist <= r_min * Nx:
+                w = r_min * Nx - dist
+                val += w * x[j]
+                sum_w += w
+        x_filtered[i] = val / sum_w if sum_w > 0 else x[i]
+    return x_filtered
+
+def sensitivity_analysis(U, x, penal):
+    dPdx = np.zeros_like(x)
+    n_nodes_x = Nx + 1
+    gradV = np.zeros((Nx * Ny, 2))
+    for ey in range(Ny):
+        for ex in range(Nx):
+            e = ey * Nx + ex
+            nodes = nodemap[ey, ex, :]
+            Vn = U[nodes]
+            gradV[e, 0] = (Vn[1] - Vn[0]) / dx
+            gradV[e, 1] = (Vn[3] - Vn[0]) / dy
+    for ey in range(Ny):
+        for ex in range(Nx):
+            e = ey * Nx + ex
+            if x[e] > 0.01:
+                sigma_deriv = penal * (sigma_metal - sigma_TCO) * x[e] ** (penal - 1)
+            else:
+                neighbors = []
+                if (ex > 0): neighbors.append((e-1, 'left'))
+                if (ex < Nx-1): neighbors.append((e+1, 'right'))
+                if (ey > 0): neighbors.append((e-Nx, 'down'))
+                if (ey < Ny-1): neighbors.append((e+Nx, 'up'))
+                dendritic_potential = 0
+                metal_neighbors = []
+                for nbr, direction in neighbors:
+                    if x[nbr] > 0.01:
+                        metal_neighbors.append((nbr, direction))
+                if metal_neighbors:
+                    for nbr, direction in metal_neighbors:
+                        grad_dot = np.dot(gradV[e], gradV[nbr])
+                        grad_norm = np.linalg.norm(gradV[e]) * np.linalg.norm(gradV[nbr])
+                        if grad_norm > 0:
+                            cos_angle = grad_dot / grad_norm
+                            if abs(cos_angle) < 0.866:
+                                dendritic_potential += 2.0
+                    if len(metal_neighbors) == 1:
+                        dendritic_potential *= 1.5
+                    elif len(metal_neighbors) == 2:
+                        dendritic_potential *= 2.0
+                sigma_deriv = penal * (sigma_metal - sigma_TCO) * (0.1 + 0.9 * dendritic_potential)
+            gradVsq = np.sum(gradV[e]**2)
+            dPdx[e] = -sigma_deriv * (thickness_TCO + thickness_metal) * gradVsq * dx * dy
+    return dPdx
+
+def update_design(x, dPdx, vol_frac_target, move=0.05):
+    x_new = np.copy(x)
+    n = Nx * Ny
+    growth_potential = np.zeros_like(x)
+    for i in range(n):
+        if x[i] < 0.01:
+            neighbors = []
+            if (i % Nx) > 0: neighbors.append((i-1, 'left'))
+            if (i % Nx) < Nx-1: neighbors.append((i+1, 'right'))
+            if (i // Nx) > 0: neighbors.append((i-Nx, 'down'))
+            if (i // Nx) < Ny-1: neighbors.append((i+Nx, 'up'))
+            metal_neighbors = [(nbr, dir) for nbr, dir in neighbors if x[nbr] > 0.01]
+            if metal_neighbors:
+                sensitivity_bonus = abs(dPdx[i]) / (abs(dPdx).max() + 1e-10)
+                neighbor_bonus = len(metal_neighbors) * 0.2
+                growth_potential[i] = sensitivity_bonus + neighbor_bonus
+    for i in range(n):
+        if x[i] < 0.01:
+            if growth_potential[i] > 0:
+                growth_rate = min(0.2, move * growth_potential[i])
+                x_new[i] = min(1.0, x[i] + growth_rate)
+        else:
+            if dPdx[i] < 0:
+                x_new[i] = min(1.0, x[i] + move * 0.5)
+            else:
+                x_new[i] = max(0.0, x[i] - move * 0.5)
+    x_new = np.clip(x_new, 0, 1)
+    vol = np.mean(x_new)
+    if vol > vol_frac_target:
+        adjustment_factor = 0.95 + 0.05 * (vol_frac_target / vol)
+        x_new = x_new * adjustment_factor
+    return x_new
+
+def calculate_corrected_photocurrent_density(jL: float, xe: float, r_val: float) -> float:
     #eq 18: as metal covers the surface, less light gets in, so jL drops
     #analogy: like putting more umbrellas over a field, less rain reaches the ground
     return jL * ((1 - xe)**r_val)
+
+class TO_GUI:
+    def __init__(self, root):
+        self.root = root
+        self.flicker_state = False
+        self.root.title("solar cell front electrode topology optimization - dendrite growth")
+        self.root.columnconfigure(0, weight=1, minsize=150)
+        self.root.columnconfigure(1, weight=3)
+        for i in range(12):
+            self.root.rowconfigure(i, weight=1)
+        self.Nx = Nx
+        self.Ny = Ny
+        self.vol_frac_target = tk.DoubleVar(value=0.03)
+        self.penal = tk.DoubleVar(value=4.0)
+        self.r_min = tk.DoubleVar(value=0.0075)
+        self.x = np.zeros(self.Nx * self.Ny)
+        self.mask = None
+        self.mask_border_pixels = []
+        if self.mask is not None:
+            mask = self.mask
+            for y in range(self.Ny):
+                for x in range(self.Nx):
+                    if mask[y, x] > 0.5:
+                        is_border = False
+                        for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                            ny, nx = y+dy, x+dx
+                            if 0<=ny<self.Ny and 0<=nx<self.Nx:
+                                if mask[ny, nx] <= 0.5:
+                                    is_border = True
+                        if y == 0 or y == self.Ny-1 or x == 0 or x == self.Nx-1:
+                            is_border = True
+                        if is_border:
+                            self.mask_border_pixels.append((y, x))
+        self.fig, self.ax = plt.subplots(figsize=(5,5))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=root)
+        self.canvas.get_tk_widget().grid(row=0, column=1, rowspan=12, padx=10, pady=10, sticky='nsew')
+        self.load_button = ttk.Button(root, text="Load Mask PNG", command=self.load_mask)
+        self.load_button.grid(row=0, column=0, pady=0, sticky='nsew')
+        ttk.Label(root, text="Volume Fraction Target").grid(row=1, column=0, sticky='nsew')
+        self.vol_slider = ttk.Scale(root, from_=0.01, to=0.1, variable=self.vol_frac_target, orient='horizontal')
+        self.vol_slider.grid(row=2, column=0, pady=0, sticky='nsew')
+        ttk.Label(root, text="SIMP Penalization (p)").grid(row=3, column=0, sticky='nsew')
+        self.penal_slider = ttk.Scale(root, from_=2.0, to=6.0, variable=self.penal, orient='horizontal')
+        self.penal_slider.grid(row=4, column=0, pady=0, sticky='nsew')
+        ttk.Label(root, text="Filter Radius (fraction of Nx)").grid(row=5, column=0, sticky='nsew')
+        self.rmin_slider = ttk.Scale(root, from_=0.0025, to=0.05, variable=self.r_min, orient='horizontal')
+        self.rmin_slider.grid(row=6, column=0, pady=0, sticky='nsew')
+        ttk.Label(root, text="Max Iterations").grid(row=7, column=0, sticky='nsew')
+        self.max_iter_entry = ttk.Entry(root)
+        self.max_iter_entry.insert(0, "100")
+        self.max_iter_entry.grid(row=8, column=0, pady=0, sticky='nsew')
+        self.run_button = ttk.Button(root, text="Run Optimization", command=self.run_optimization)
+        self.run_button.grid(row=9, column=0, pady=0, sticky='nsew')
+        self.status_label = ttk.Label(root, text="ready: busbars = mask border (red)")
+        self.status_label.grid(row=11, column=0, columnspan=2, pady=0, sticky='nsew')
+        self.update_plot()
+
+    def load_mask(self):
+        from tkinter import filedialog
+        from PIL import Image
+        file_path = filedialog.askopenfilename(title="Select Mask PNG", filetypes=[("PNG files", "*.png")])
+        if file_path:
+            try:
+                img = Image.open(file_path).convert('L')
+                img = img.resize((self.Nx, self.Ny))
+                self.mask = np.array(img) / 255.0
+                self.x = 0.1 * self.mask.flatten()
+                xmat = self.x.reshape((self.Ny, self.Nx))
+                self.mask_border_pixels = []
+                mask = self.mask
+                for y in range(self.Ny):
+                    for x in range(self.Nx):
+                        if mask[y, x] > 0.5:
+                            is_border = False
+                            for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                                ny, nx = y+dy, x+dx
+                                if 0<=ny<self.Ny and 0<=nx<self.Nx:
+                                    if mask[ny, nx] <= 0.5:
+                                        is_border = True
+                            if y == 0 or y == self.Ny-1 or x == 0 or x == self.Nx-1:
+                                is_border = True
+                            if is_border:
+                                self.mask_border_pixels.append((y, x))
+                                xmat[y, x] = 1.0
+                self.x = xmat.flatten()
+                self.update_plot()
+                self.status_label.config(text=f"Loaded mask from {file_path}")
+            except Exception as e:
+                self.status_label.config(text=f"Error loading mask: {str(e)}")
+
+    def update_plot(self):
+        self.ax.clear()
+        x_reshaped = self.x.reshape((self.Ny, self.Nx))
+        self.ax.imshow(x_reshaped, cmap='inferno', origin='lower', vmin=0, vmax=1)
+        if self.mask is not None:
+            self.ax.imshow(self.mask, cmap='gray', alpha=0.3, origin='lower')
+        if hasattr(self, 'mask_border_pixels'):
+            for y, x in self.mask_border_pixels:
+                self.ax.plot(x, y, 'ro', markersize=6, markeredgecolor='k')
+        self.ax.set_title("electrode density")
+        self.ax.axis('off')
+        self.canvas.draw()
+
+    def reset(self):
+        if self.mask is not None:
+            self.x = 0.1 * self.mask.flatten()
+            xmat = self.x.reshape((self.Ny, self.Nx))
+            self.mask_border_pixels = []
+            mask = self.mask
+            for y in range(self.Ny):
+                for x in range(self.Nx):
+                    if mask[y, x] > 0.5:
+                        is_border = False
+                        for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                            ny, nx = y+dy, x+dx
+                            if 0<=ny<self.Ny and 0<=nx<self.Nx:
+                                if mask[ny, nx] <= 0.5:
+                                    is_border = True
+                        if y == 0 or y == self.Ny-1 or x == 0 or x == self.Nx-1:
+                            is_border = True
+                        if is_border:
+                            self.mask_border_pixels.append((y, x))
+                            xmat[y, x] = 1.0
+            self.x = xmat.flatten()
+        else:
+            self.x = np.zeros(self.Nx * self.Ny)
+            center_idx = (self.Ny // 2) * self.Nx + (self.Nx // 2)
+            self.x[center_idx] = 1.0
+            self.mask_border_pixels = []
+        self.status_label.config(text="ready: busbars = mask border (red)")
+        self.update_plot()
+
+    def run_optimization(self):
+        try:
+            max_iter = int(self.max_iter_entry.get())
+        except ValueError:
+            max_iter = 100
+            self.max_iter_entry.delete(0, tk.END)
+            self.max_iter_entry.insert(0, str(max_iter))
+            print("warning: invalid max_iter input, using default 100")
+        penal_val = self.penal.get()
+        vol_target = self.vol_frac_target.get()
+        rmin_val = self.r_min.get()
+        print(f"using gui params: max_iter={max_iter}, penal={penal_val:.2f}, vol_target={vol_target:.3f}, rmin={rmin_val:.4f}")
+        xe = self.x.copy()
+        if self.mask is not None:
+            xe = xe.reshape((self.Ny, self.Nx))
+            for y, x_pos in self.mask_border_pixels:
+                xe[y, x_pos] = 1.0
+            xe = xe.flatten()
+        else:
+            for y in range(self.Ny):
+                xe[y*self.Nx + 0] = 1.0
+                xe[y*self.Nx + (self.Nx-1)] = 1.0
+        print(f"initial sum(x): {np.sum(xe):.2f}")
+        self.status_label.config(text="starting optimization...")
+        self.root.update_idletasks()
+        self.run_button.config(state='disabled')
+        try:
+            for it in range(max_iter):
+                # Compute voltage and current distribution
+                voltage = newton_solver(xe, penal_val)
+                current_density = compute_current_density(voltage, xe, penal_val)
+                
+                # Compute objective and sensitivity
+                power = power_output(voltage, xe, penal_val)
+                dc = sensitivity_analysis(voltage, xe, penal_val)
+                
+                # Apply sensitivity filter
+                dc_filtered = density_filter(dc, rmin_val)
+                
+                # Update design variable using optimality criteria
+                l1 = 0
+                l2 = 1e9
+                while (l2 - l1) / (l2 + l1) > 1e-3:
+                    lmid = 0.5 * (l2 + l1)
+                    x_new = np.clip(
+                        xe * np.sqrt(-dc_filtered / lmid),
+                        0.001, 1.0
+                    )
+                    
+                    # Handle mask and busbars
+                    if self.mask is not None:
+                        x_new = x_new.reshape((self.Ny, self.Nx))
+                        for y, x_pos in self.mask_border_pixels:
+                            x_new[y, x_pos] = 1.0
+                        x_new = x_new.flatten()
+                        x_new = x_new * self.mask.flatten()
+                    else:
+                        x_new = x_new.reshape((self.Ny, self.Nx))
+                        x_new[:,0] = 1.0
+                        x_new[:,-1] = 1.0
+                        x_new = x_new.flatten()
+                    
+                    if x_new.mean() - vol_target > 0:
+                        l1 = lmid
+                    else:
+                        l2 = lmid
+                
+                xe = x_new
+                self.x = xe
+                
+                # Print progress
+                print(f"Iter {it+1}: Power = {power:.3e}, Volume = {xe.mean():.3f}")
+                try:
+                    # Use safer widget update approach
+                    if self.status_label.winfo_exists():
+                        self.status_label.config(text=f'iteration {it+1}/{max_iter}')
+                    if it % 2 == 0 or it == max_iter - 1:
+                        if self.canvas.winfo_exists():
+                            self.update_plot()
+                    # Use safer update approach
+                    if self.root.winfo_exists():
+                        self.root.update_idletasks()
+                except tk.TclError as e:
+                    print(f"GUI update error: {e}")
+                    # Continue optimization even if GUI update fails
+        finally:
+            self.run_button.config(state='normal')
+        self.status_label.config(text="optimization complete")
+        self.update_plot()
+
+root = tk.Tk()
+app = TO_GUI(root)
+root.mainloop()
 
 def calculate_element_current_density(j_star_L: float, j0_val: float, beta_val: float, local_voltage: float) -> float:
     #eq 17: total current is the sum of light current and diode current
@@ -77,7 +557,7 @@ def calculate_efficiency(Pout: float, Ac: float, pinp: float) -> float:
         raise ValueError("Cell area (Ac) and input power density (pinp) must be positive.")
     return (Pout / (Ac * pinp)) * 100.0
 
-# End of new functions
+#end of new functions
 
 def element_conductivity_matrix(dx, dy):
     #returns the local conductivity matrix for a single element
@@ -240,57 +720,57 @@ def sensitivity_analysis(U, x, penal):
     dPdx = np.zeros_like(x)
     n_nodes_x = Nx + 1
     
-    # Calculate voltage gradients for all elements
+    #Calculate voltage gradients for all elements
     gradV = np.zeros((Nx * Ny, 2))
     for ey in range(Ny):
         for ex in range(Nx):
             e = ey * Nx + ex
             nodes = nodemap[ey, ex, :]
             Vn = U[nodes]
-            gradV[e, 0] = (Vn[1] - Vn[0]) / dx  # x-gradient
-            gradV[e, 1] = (Vn[3] - Vn[0]) / dy  # y-gradient
+            gradV[e, 0] = (Vn[1] - Vn[0]) / dx  #x-gradient
+            gradV[e, 1] = (Vn[3] - Vn[0]) / dy  #y-gradient
     
-    # Calculate sensitivity with enhanced dendritic growth
+    #Calculate sensitivity with enhanced dendritic growth
     for ey in range(Ny):
         for ex in range(Nx):
             e = ey * Nx + ex
-            if x[e] > 0.01:  # Already metal (lower threshold for debug)
-                # Stronger sensitivity for existing metal to promote growth
+            if x[e] > 0.01:  #Already metal (lower threshold for debug)
+                #Stronger sensitivity for existing metal to promote growth
                 sigma_deriv = penal * (sigma_metal - sigma_TCO) * x[e] ** (penal - 1)
             else:
-                # Enhanced dendritic growth logic
+                #Enhanced dendritic growth logic
                 neighbors = []
                 if (ex > 0): neighbors.append((e-1, 'left'))
                 if (ex < Nx-1): neighbors.append((e+1, 'right'))
                 if (ey > 0): neighbors.append((e-Nx, 'down'))
                 if (ey < Ny-1): neighbors.append((e+Nx, 'up'))
                 
-                # Calculate dendritic potential
+                #Calculate dendritic potential
                 dendritic_potential = 0
                 metal_neighbors = []
                 for nbr, direction in neighbors:
-                    if x[nbr] > 0.01:  # If neighbor is metal (lower threshold for debug)
+                    if x[nbr] > 0.01:  #If neighbor is metal (lower threshold for debug)
                         metal_neighbors.append((nbr, direction))
                 
                 if metal_neighbors:
-                    # Calculate branching potential based on neighbor gradients and positions
+                    #Calculate branching potential based on neighbor gradients and positions
                     for nbr, direction in metal_neighbors:
-                        # Calculate angle between gradients
+                        #Calculate angle between gradients
                         grad_dot = np.dot(gradV[e], gradV[nbr])
                         grad_norm = np.linalg.norm(gradV[e]) * np.linalg.norm(gradV[nbr])
                         if grad_norm > 0:
                             cos_angle = grad_dot / grad_norm
-                            # Strongly promote growth at angles between 30-150 degrees
-                            if abs(cos_angle) < 0.866:  # cos(30 degrees)
-                                dendritic_potential += 2.0  # Increased from 1.0
+                            #Strongly promote growth at angles between 30-150 degrees
+                            if abs(cos_angle) < 0.866:  #cos(30 degrees)
+                                dendritic_potential += 2.0  #Increased from 1.0
                     
-                    # Additional dendritic growth promotion
-                    if len(metal_neighbors) == 1:  # Single metal neighbor
-                        dendritic_potential *= 1.5  # Encourage extension
-                    elif len(metal_neighbors) == 2:  # Two metal neighbors
-                        dendritic_potential *= 2.0  # Strongly encourage branching
+                    #Additional dendritic growth promotion
+                    if len(metal_neighbors) == 1:  #Single metal neighbor
+                        dendritic_potential *= 1.5  #Encourage extension
+                    elif len(metal_neighbors) == 2:  #Two metal neighbors
+                        dendritic_potential *= 2.0  #Strongly encourage branching
                 
-                # Enhanced sensitivity for potential dendritic points
+                #Enhanced sensitivity for potential dendritic points
                 sigma_deriv = penal * (sigma_metal - sigma_TCO) * (0.1 + 0.9 * dendritic_potential)
             
             gradVsq = np.sum(gradV[e]**2)
@@ -302,40 +782,40 @@ def update_design(x, dPdx, vol_frac_target, move=0.05):
     x_new = np.copy(x)
     n = Nx * Ny
     
-    # First pass: identify potential dendritic growth points
+    #First pass: identify potential dendritic growth points
     growth_potential = np.zeros_like(x)
     for i in range(n):
-        if x[i] < 0.01:  # Not metal (lower threshold for debug)
-            # Check neighbors for existing metal
+        if x[i] < 0.01:  #Not metal (lower threshold for debug)
+            #Check neighbors for existing metal
             neighbors = []
             if (i % Nx) > 0: neighbors.append((i-1, 'left'))
             if (i % Nx) < Nx-1: neighbors.append((i+1, 'right'))
             if (i // Nx) > 0: neighbors.append((i-Nx, 'down'))
             if (i // Nx) < Ny-1: neighbors.append((i+Nx, 'up'))
             
-            metal_neighbors = [(nbr, dir) for nbr, dir in neighbors if x[nbr] > 0.01] # Lower threshold
+            metal_neighbors = [(nbr, dir) for nbr, dir in neighbors if x[nbr] > 0.01] #Lower threshold
             
             if metal_neighbors:
-                # Simplified: Moderate bonus if any metal neighbor exists to encourage general growth
-                growth_potential[i] = 1.5 # Moderate, uniform bonus
+                #Simplified: Moderate bonus if any metal neighbor exists to encourage general growth
+                growth_potential[i] = 1.5 #Moderate, uniform bonus
     
-    # Second pass: update design with enhanced dendritic growth
+    #Second pass: update design with enhanced dendritic growth
     for i in range(n):
-        if x[i] < 0.01:  # Not metal (lower threshold for debug)
+        if x[i] < 0.01:  #Not metal (lower threshold for debug)
             if growth_potential[i] > 0:
-                # Enhanced growth at dendritic points
-                x_new[i] = min(1.0, x[i] + 0.5)  # Aggressive debug growth
+                #Enhanced growth at dendritic points
+                x_new[i] = min(1.0, x[i] + 0.5)  #Aggressive debug growth
         else:
-            # Existing metal: update normally
-            x_new[i] = min(1.0, x[i] + 0.1)   # Aggressive debug reinforcement
+            #Existing metal: update normally
+            x_new[i] = min(1.0, x[i] + 0.1)   #Aggressive debug reinforcement
     
-    # Apply stronger filtering to maintain dendritic structure
+    #apply stronger filtering to maintain dendritic structure
     x_new = np.clip(x_new, 0, 1)
     
-    # Enforce volume constraint with gradual adjustment
+    #enforce volume constraint with gradual adjustment
     vol = np.mean(x_new)
     if vol > vol_frac_target:
-        # Gradual volume adjustment to maintain dendritic structure
+        #gradual volume adjustment to maintain dendritic structure
         adjustment_factor = 0.95 + 0.05 * (vol_frac_target / vol)
         x_new = x_new * adjustment_factor
     
@@ -343,6 +823,147 @@ def update_design(x, dPdx, vol_frac_target, move=0.05):
 
 class TO_GUI:
     def __init__(self, root):
+        #initialize gui and state
+        self.root = root
+        self.flicker_state = False  #flicker toggle for animation
+        self.root.title("solar cell front electrode topology optimization - dendrite growth")
+        self.root.columnconfigure(0, weight=1, minsize=150) #left: controls
+        self.root.columnconfigure(1, weight=3) #right: plot
+        for i in range(12):
+            self.root.rowconfigure(i, weight=1)
+
+        self.Nx = Nx
+        self.Ny = Ny
+        self.vol_frac_target = tk.DoubleVar(value=0.03)
+        self.penal = tk.DoubleVar(value=4.0)
+        self.r_min = tk.DoubleVar(value=0.0075)
+
+        #initialize design as all empty
+        self.x = np.zeros(self.Nx * self.Ny)
+        self.mask = None
+
+        #detect mask border (white-black boundary) for busbars
+        self.mask_border_pixels = [] #list of (y, x) tuples
+        #mask must be loaded before this runs
+        if self.mask is not None:
+            mask = self.mask
+            for y in range(self.Ny):
+                for x in range(self.Nx):
+                    if mask[y, x] > 0.5:
+                        #check 4-neighbors for at least one background neighbor
+                        is_border = False
+                        for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                            ny, nx = y+dy, x+dx
+                            if 0<=ny<self.Ny and 0<=nx<self.Nx:
+                                if mask[ny, nx] <= 0.5:
+                                    is_border = True
+                        #also treat edge of frame as border if mask pixel touches frame
+                        if y == 0 or y == self.Ny-1 or x == 0 or x == self.Nx-1:
+                            is_border = True
+                        if is_border:
+                            self.mask_border_pixels.append((y, x))
+        #busbars always fixed, always visible
+
+        #make the plot and embed in gui
+        self.fig, self.ax = plt.subplots(figsize=(5,5))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=root)
+        self.canvas.get_tk_widget().grid(row=0, column=1, rowspan=12, padx=10, pady=10, sticky='nsew')
+        #no mpl_connect needed for edge busbars
+
+        #add all the control widgets
+        self.load_button = ttk.Button(root, text="Load Mask PNG", command=self.load_mask)
+        self.load_button.grid(row=0, column=0, pady=0, sticky='nsew')
+
+        ttk.Label(root, text="Volume Fraction Target").grid(row=1, column=0, sticky='nsew')
+        self.vol_slider = ttk.Scale(root, from_=0.01, to=0.1, variable=self.vol_frac_target, orient='horizontal')
+        self.vol_slider.grid(row=2, column=0, pady=0, sticky='nsew')
+
+        ttk.Label(root, text="SIMP Penalization (p)").grid(row=3, column=0, sticky='nsew')
+        self.penal_slider = ttk.Scale(root, from_=2.0, to=6.0, variable=self.penal, orient='horizontal')
+        self.penal_slider.grid(row=4, column=0, pady=0, sticky='nsew')
+
+        ttk.Label(root, text="Filter Radius (fraction of Nx)").grid(row=5, column=0, sticky='nsew')
+        self.rmin_slider = ttk.Scale(root, from_=0.0025, to=0.05, variable=self.r_min, orient='horizontal')
+        self.rmin_slider.grid(row=6, column=0, pady=0, sticky='nsew')
+
+        ttk.Label(root, text="Max Iterations").grid(row=7, column=0, sticky='nsew')
+        self.max_iter_entry = ttk.Entry(root)
+        self.max_iter_entry.insert(0, "100")
+        self.max_iter_entry.grid(row=8, column=0, pady=0, sticky='nsew')
+
+        self.run_button = ttk.Button(root, text="Run Optimization", command=self.run_optimization)
+        self.run_button.grid(row=9, column=0, pady=0, sticky='nsew')
+
+        self.status_label = ttk.Label(root, text="ready: busbars = mask border (red)")
+        self.status_label.grid(row=11, column=0, columnspan=2, pady=0, sticky='nsew')
+
+        self.update_plot() #draw the initial plot
+
+
+    def load_mask(self):
+        #load mask png and automatically reset design and busbars
+        file_path = filedialog.askopenfilename(filetypes=[('PNG Files', '*.png')])
+        if not file_path:
+            return
+        img = Image.open(file_path).convert('L')
+        mask = np.array(img) / 255.0
+        #resize mask if needed
+        if mask.shape != (self.Ny, self.Nx):
+            from skimage.transform import resize
+            mask = resize(mask, (self.Ny, self.Nx), order=0, preserve_range=True, anti_aliasing=False)
+        self.mask = (mask > 0.5).astype(float)
+        self.reset() #automatically update design and busbars
+
+    def update_plot(self):
+        #plot mask, design, and busbar border
+        self.ax.clear()
+        x_reshaped = self.x.reshape((self.Ny, self.Nx))
+        self.ax.imshow(x_reshaped, cmap='inferno', origin='lower', vmin=0, vmax=1)
+        if self.mask is not None:
+            self.ax.imshow(self.mask, cmap='gray', alpha=0.3, origin='lower')
+        #draw mask border busbars as red dots
+        if hasattr(self, 'mask_border_pixels'):
+            for y, x in self.mask_border_pixels:
+                self.ax.plot(x, y, 'ro', markersize=6, markeredgecolor='k')
+        self.ax.set_title("electrode density")
+        self.ax.axis('off')
+        self.canvas.draw()
+
+
+
+    def reset(self):
+        #reset mask and design; busbars on mask border
+        if self.mask is not None:
+            #initialize x to 0.1 in design region (white), 0 elsewhere
+            self.x = 0.1 * self.mask.flatten()
+            #set mask border pixels to 1.0 for busbars
+            xmat = self.x.reshape((self.Ny, self.Nx))
+            #recompute mask border pixels in case mask changed
+            self.mask_border_pixels = []
+            mask = self.mask
+            for y in range(self.Ny):
+                for x in range(self.Nx):
+                    if mask[y, x] > 0.5:
+                        is_border = False
+                        for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                            ny, nx = y+dy, x+dx
+                            if 0<=ny<self.Ny and 0<=nx<self.Nx:
+                                if mask[ny, nx] <= 0.5:
+                                    is_border = True
+                        if y == 0 or y == self.Ny-1 or x == 0 or x == self.Nx-1:
+                            is_border = True
+                        if is_border:
+                            self.mask_border_pixels.append((y, x))
+                            xmat[y, x] = 1.0
+            self.x = xmat.flatten()
+        else:
+            self.x = np.zeros(self.Nx * self.Ny)
+            center_idx = (self.Ny // 2) * self.Nx + (self.Nx // 2)
+            self.x[center_idx] = 1.0
+            self.mask_border_pixels = []
+        self.status_label.config(text="ready: busbars = mask border (red)")
+        self.update_plot()
+
         self.root = root
         self.flicker_state = False  #flicker toggle for animation
         self.root.title("Solar Cell Front Electrode Topology Optimization - Dendrite Growth")
@@ -410,19 +1031,19 @@ class TO_GUI:
         
         if file_path:
             try:
-                # Load and resize image
+                #Load and resize image
                 img = Image.open(file_path).convert('L')
                 img = img.resize((self.Nx, self.Ny))
                 self.mask = np.array(img) / 255.0
                 
-                # Initialize design variable with mask
+                #Initialize design variable with mask
                 self.x = np.zeros_like(self.mask.flatten())
-                # Add seed points where mask is white
+                #Add seed points where mask is white
                 seed_points = np.where(self.mask.flatten() > 0.5)[0]
                 if len(seed_points) > 0:
                     self.x[seed_points] = 1.0
                 
-                # Update plot
+                #Update plot
                 self.update_plot()
                 self.status_label.config(text=f"Loaded mask from {file_path}")
             except Exception as e:
@@ -430,54 +1051,148 @@ class TO_GUI:
 
     def update_plot(self):
         if not hasattr(self, 'ax') or self.ax is None:
-            return # Plot components are not initialized (likely for GUI debugging)
+            return #Plot components are not initialized (likely for GUI debugging)
         self.ax.clear()
         x_reshaped = self.x.reshape((self.Ny, self.Nx))
         self.ax.imshow(x_reshaped, cmap='inferno', origin='lower', vmin=0, vmax=1)
         if self.mask is not None:
-            # Overlay mask in semi-transparent white
+            #Overlay mask in semi-transparent white
             self.ax.imshow(self.mask, cmap='gray', alpha=0.3, origin='lower')
         self.ax.set_title("Electrode Density")
         self.canvas.draw()
 
     def reset(self):
         if self.mask is not None:
-            # Reset to seed points in mask
+            #reset to seed points in mask
             self.x = np.zeros_like(self.mask.flatten())
             seed_points = np.where(self.mask.flatten() > 0.5)[0]
             if len(seed_points) > 0:
                 self.x[seed_points] = 1.0
         else:
-            # Reset to single center point
+            #reset to single center point
             self.x = np.zeros(self.Nx * self.Ny)
             center_idx = (self.Ny // 2) * self.Nx + (self.Nx // 2)
             self.x[center_idx] = 1.0
         self.update_plot()
 
     def run_optimization(self):
-        # If no mask is loaded, self.x should be initialized by self.reset() 
-        # (e.g., to a single point or other default)
-        # The optimization will then run based on that initial self.x
+        #run optimization with edge busbars (left=anode, right=cathode)
         try:
             max_iter = int(self.max_iter_entry.get())
         except ValueError:
-            max_iter = 100 # Default if entry is invalid
+            max_iter = 100 #default if entry is invalid
             self.max_iter_entry.delete(0, tk.END)
             self.max_iter_entry.insert(0, str(max_iter))
-            print("Warning: Invalid max_iter input, using default 100")
+            print("warning: invalid max_iter input, using default 100")
 
         penal_val = self.penal.get()
         vol_target = self.vol_frac_target.get()
         rmin_val = self.r_min.get()
-        print(f"Using GUI params: max_iter={max_iter}, penal={penal_val:.2f}, vol_target={vol_target:.3f}, rmin={rmin_val:.4f}")
+        print(f"using gui params: max_iter={max_iter}, penal={penal_val:.2f}, vol_target={vol_target:.3f}, rmin={rmin_val:.4f}")
 
-        x = self.x.copy() # Start with the current design (could be from reset or mask)
-        
-        # Start with a smaller move limit and gradually increase it
-        # move_limit = 0.01 # Redundant: move_limit is now set consistently in the loop
+        #do not reset self.x here! only use current self.x
+        x = self.x.copy()
+        #if mask is present, forcibly set busbar columns to metal in both x and mask
+        if self.mask is not None:
+            mask = self.mask.copy()
+            mask[:,0] = 1.0
+            mask[:,-1] = 1.0
+            self.mask = mask
+            x = x.reshape((self.Ny, self.Nx))
+            x[:,0] = 1.0
+            x[:,-1] = 1.0
+            x = x.flatten()
+        else:
+            for y in range(self.Ny):
+                x[y*self.Nx + 0] = 1.0
+                x[y*self.Nx + (self.Nx-1)] = 1.0
+
+        print(f"initial sum(x): {np.sum(x):.2f}")
+        self.status_label.config(text="starting optimization...")
+        self.root.update_idletasks() #ensure status label updates
+
+        #prevent accidental restart: disable run button
+        self.run_button.config(state='disabled')
+        try:
+            for it in range(max_iter):
+                move_limit = 0.015
+                U = newton_solver(x, penal_val)
+                #enforce electrode voltages at edge nodes
+                n_nodes_x = self.Nx + 1
+                n_nodes_y = self.Ny + 1
+                U_nodes = U.reshape(-1)
+                for y in range(self.Ny):
+                    anode_node = y*(self.Nx+1) + 0
+                    cathode_node = y*(self.Nx+1) + self.Nx
+                    U_nodes[anode_node] = 1.0
+                    U_nodes[cathode_node] = 0.0
+                dPdx = sensitivity_analysis(U, x, penal_val)
+                x_filtered = density_filter(x, rmin_val)
+                x_updated = update_design(x_filtered, dPdx, vol_target, move=move_limit)
+                #keep edge busbars fixed to metal
+                x_updated = x_updated.reshape((self.Ny, self.Nx))
+                x_updated[:,0] = 1.0
+                x_updated[:,-1] = 1.0
+                x_updated = x_updated.flatten()
+                if self.mask is not None:
+                    x = x_updated * self.mask.flatten()
+                    #set mask border pixels to 1.0 for busbars - recognize the border between white (designable) and black (void) regions
+                    xmat = x.reshape((self.Ny, self.Nx))
+                    #recompute mask border pixels in case mask changed
+                    self.mask_border_pixels = []
+                    mask = self.mask
+                    for y in range(self.Ny):
+                        for xpix in range(self.Nx):
+                            # Check if this is a designable region (white)
+                            if mask[y, xpix] > 0.5:
+                                # Check if any neighboring pixel is in the void region (black)
+                                for dy, dx in [(-1,0),(1,0),(0,-1),(0,1)]:
+                                    ny, nx = y+dy, xpix+dx
+                                    if 0<=ny<self.Ny and 0<=nx<self.Nx:
+                                        # If neighbor is in void region (black), this is a border pixel
+                                        if mask[ny, nx] <= 0.5:
+                                            self.mask_border_pixels.append((y, xpix))
+                                            # Set this border pixel as a busbar (metal = 1.0)
+                                            xmat[y, xpix] = 1.0
+                                            break
+                    x = xmat.flatten()
+                else:
+                    x = x_updated
+                self.x = x
+                print(f"iteration {it+1}: sum(x)={np.sum(self.x):.2f}")
+                #check if status_label still exists before updating
+                if str(self.status_label) in self.root.children.values() or hasattr(self.status_label, 'config'):
+                    self.status_label.config(text=f'iteration {it+1}/{max_iter}')
+                if it % 2 == 0 or it == max_iter - 1:
+                    self.update_plot()
+                self.root.update()
+                self.root.update_idletasks()
+        finally:
+            self.run_button.config(state='normal')
+        self.status_label.config(text="optimization complete")
+        self.update_plot()
+
+
+        #if no mask is loaded, self.x should be initialized by self.reset() 
+        #(e.g., to a single point or other default)
+        #the optimization will then run based on that initial self.x
+        try:
+            max_iter = int(self.max_iter_entry.get())
+        except ValueError:
+            max_iter = 100 #default if entry is invalid
+            self.max_iter_entry.delete(0, tk.END)
+            self.max_iter_entry.insert(0, str(max_iter))
+            print("warning: invalid max_iter input, using default 100")
+
+        penal_val = self.penal.get()
+        vol_target = self.vol_frac_target.get()
+        rmin_val = self.r_min.get()
+        print(f"using GUI params: max_iter={max_iter}, penal={penal_val:.2f}, vol_target={vol_target:.3f}, rmin={rmin_val:.4f}")
+
+        x = self.x.copy() #start with the current design (could be from reset or mask)
         
         self.status_label.config(text="Starting optimization...")
-        self.root.update_idletasks() # Ensure status label updates
+        self.root.update_idletasks() #ensure status label updates
 
         for it in range(max_iter):
             #gradually increase move limit (not used in this debug version)
